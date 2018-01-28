@@ -467,7 +467,7 @@ class AlphaBacktestInstance(BacktestInstance):
             mask = dates > date
             return dates[mask][n-1]
         else:
-            return self.ctx.data_api.get_next_trade_date(date, n)
+            return self.ctx.data_api.query_next_trade_date(date, n)
     
     def _get_last_trade_date(self, date):
         if self.ctx.dataview is not None:
@@ -475,7 +475,7 @@ class AlphaBacktestInstance(BacktestInstance):
             mask = dates < date
             return dates[mask][-1]
         else:
-            return self.ctx.data_api.get_last_trade_date(date)
+            return self.ctx.data_api.query_last_trade_date(date)
     
     def go_next_rebalance_day(self):
         """
@@ -500,9 +500,6 @@ class AlphaBacktestInstance(BacktestInstance):
                 next_period_day = jutil.get_next_period_day(current_date, self.ctx.strategy.period,
                                                             n=self.ctx.strategy.n_periods,
                                                             extra_offset=self.ctx.strategy.days_delay)
-                if next_period_day > self.end_date:
-                    return True
-                
                 # update current_date: next_period_day is a workday, but not necessarily a trade date
                 if self._is_trade_date(next_period_day):
                     current_date = next_period_day
@@ -511,7 +508,10 @@ class AlphaBacktestInstance(BacktestInstance):
                         current_date = self._get_next_trade_date(next_period_day)
                     except IndexError:
                         return True
-        
+                
+            if current_date > self.end_date:
+                return True
+
             # update re-balance date
             if self.current_rebalance_date > 0:
                 self.last_rebalance_date = self.current_rebalance_date
@@ -744,7 +744,7 @@ class EventBacktestInstance(BacktestInstance):
     
     def _run_bar(self):
         """Quotes of different symbols will be aligned into one dictionary."""
-        trade_dates_arr = self.ctx.data_api.get_trade_date_range(self.start_date, self.end_date)
+        trade_dates_arr = self.ctx.data_api.query_trade_dates(self.start_date, self.end_date)
 
         last_trade_date = trade_dates_arr[0]
         for trade_date in trade_dates_arr:
