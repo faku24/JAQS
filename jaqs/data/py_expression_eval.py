@@ -223,7 +223,7 @@ class Expression(object):
             item = self.tokens[i]
             if item.type_ == TVAR and \
                     not item.index_ in vars and \
-                    item.index_ not in self.functions:
+                    True : #item.index_ not in self.functions:
                 vars.append(item.index_)
         return vars
 
@@ -322,6 +322,7 @@ class Parser(object):
             'GroupQuantile': self.group_quantile,
             'Rank': self.rank,
             'GroupRank': self.group_rank,
+            'Mask': self.mask,
             'ConditionRank': self.cond_rank,
             'ConditionPercentile': self.cond_percentile,
             'ConditionQuantile': self.cond_quantile,
@@ -339,8 +340,8 @@ class Parser(object):
             'Ts_Quantile': self.ts_quantile,
             'Ewma': self.ewma,
             'Sma':self.sma,
-            'Sum': self.sum,
-            'Product': self.product,  # rolling product
+            'Ts_Sum': self.ts_sum,
+            'Ts_Product': self.ts_product,  # rolling product
             'CountNans': self.count_nans,  # rolling count Nans
             'StdDev': self.std_dev,
             'Covariance': self.cov,
@@ -361,8 +362,12 @@ class Parser(object):
             # inplace
             'Pow': np.power,
             'SignedPower': self.signed_power,
+            'IsNan': self.is_nan,
             # others
             'If': self.ifFunction,
+            'FillNan': self.fill_nan,
+            'Return_Abs': self.calc_return_abs,
+            'Return_Fwd': self.calc_return_fwd,
             # test
         }
         
@@ -427,6 +432,10 @@ class Parser(object):
     
     def pow(self, a, b):
         return np.power(a, b)
+
+    def signed_power(self, x, e):
+        signs = np.sign(x)
+        return signs * np.power(np.abs(x), e)
     
     def concat(self, a, b, *args):
         result = u'{0}{1}'.format(a, b)
@@ -571,22 +580,14 @@ class Parser(object):
         r = df.ewm(com=a, axis=0)
         return r.mean()
     
-    def corr(self, x, y, n):
-        (x, y) = self._align_bivariate(x, y)
-        return pd.rolling_corr(x, y, n)
-    
-    def cov(self, x, y, n):
-        (x, y) = self._align_bivariate(x, y)
-        return pd.rolling_cov(x, y, n)
-    
     def std_dev(self, x, n):
-        return pd.rolling_std(x, n)
+        return x.rolling(n).std()
     
-    def sum(self, x, n):
-        return pd.rolling_sum(x, n)
+    def ts_sum(self, x, n):
+        return x.rolling(n).sum()
     
     def count_nans(self, x, n):
-        return n - pd.rolling_count(x, n)
+        return n - x.rolling(n).count()
     
     def delay(self, x, n):
         return x.shift(n)
@@ -604,35 +605,23 @@ class Parser(object):
         return res
     
     def ts_mean(self, x, n):
-        return pd.rolling_mean(x, n)
+        return x.rolling(n).mean()
     
     def ts_min(self, x, n):
-        return pd.rolling_min(x, n)
+        return x.rolling(n).min()
     
     def ts_max(self, x, n):
-        return pd.rolling_max(x, n)
+        return x.rolling(n).max()
     
     def ts_kurt(self, x, n):
-        return pd.rolling_kurt(x, n)
+        return x.rolling(n).kurt()
     
     def ts_skew(self, x, n):
-        return pd.rolling_skew(x, n)
+        return x.rolling(n).skew()
     
-    def product(self, x, n):
-        return pd.rolling_apply(x, n, np.product)
+    def ts_product(self, x, n):
+        return x.rolling(n).apply(np.product)
     
-    @staticmethod
-    def calc_ttm(df):
-        return calc_ttm(cum_to_single_quarter(df, df.index))
-    
-    @staticmethod
-    def calc_ttm_jli(df):
-        return calc_ttm(df)
-
-    @staticmethod
-    def cum_to_single(df):
-        return cum_to_single_quarter(df, df.index)
-
     @staticmethod
     def ts_rank(df, window):
         """Return a DataFrame with values ranging from 0.0 to 1.0"""
@@ -658,7 +647,30 @@ class Parser(object):
     
         res = roll.apply(_rank_arr, kwargs={'norm': window})
         return res
+
+    # Time Series Two Parameters
+    def corr(self, x, y, n):
+        (x, y) = self._align_bivariate(x, y)
+        return x.rolling(n).corr(y)
+
+    def cov(self, x, y, n):
+        (x, y) = self._align_bivariate(x, y)
+        return x.rolling(n).cov(y)
+
+    # financial statement data
+    @staticmethod
+    def calc_ttm(df):
+        return calc_ttm(cum_to_single_quarter(df, df.index))
     
+    @staticmethod
+    def calc_ttm_jli(df):
+        return calc_ttm(df)
+
+    @staticmethod
+    def cum_to_single(df):
+        return cum_to_single_quarter(df, df.index)
+
+    # no use
     def step(self, x, n):
         st = x.copy()
         n = n + 1
@@ -680,17 +692,43 @@ class Parser(object):
         return np.dot(x, step) / np.sum(step)
     
     def decay_linear(self, x, n):
-        return pd.rolling_apply(x, n, self.decay_linear_array)
+        return x.rolling(n).apply(self.decay_linear_array)
     
     def decay_exp(self, x, f, n):
-        return pd.rolling_apply(x, n, self.decay_exp_array, args=[f])
+        return x.rolling(n).apply(self.decay_exp_array, args=[f])
     
-    def signed_power(self, x, e):
-        signs = np.sign(x)
-        return signs * np.power(np.abs(x), e)
+    @staticmethod
+    def is_nan(df):
+        return df.isnull()
+
+    def fill_nan(self, df, value=None, fmethod = 'ffill'):
+        if value != None:
+            df = df.fillna(value=value)
+            return df
+        else:
+            df = df.fillna(method = fmethod)
+            return df
+
+    @staticmethod
+    def calc_return_abs(df, forward=1):
+        shift = df.shift(forward)
+        res = (df - shift) / abs(shift)
+        return res
+
+    @staticmethod
+    def calc_return_fwd(df, forward=1):
+        shift = df.shift(-forward)
+        res = (shift - df) / df
+        return res
 
     # -----------------------------------------------------
     # Cross Section functions
+    
+    @staticmethod
+    def mask(df, mask):
+        df[mask] = np.nan
+        return df
+        
     def cond_rank(self, df, cond):
         cond = cond.fillna(0.0).astype(bool)
         df, cond = self._align_bivariate(df, cond)
@@ -1199,6 +1237,7 @@ class Parser(object):
                 n1 = nstack.pop()
                 f = nstack.pop()
                 if callable(f):
+                    # FIXME: Should set value for factor if it is in list.
                     if type(n1) is list:
                         nstack.append(f(*n1))
                     else:
