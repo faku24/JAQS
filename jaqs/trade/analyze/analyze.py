@@ -35,6 +35,7 @@ from jaqs.data.py_expression_eval import Parser
 from jaqs.trade import common
 
 import jaqs.util as jutil
+from jaqs.util.profile import prof_sample_begin, prof_sample_end
 
 STATIC_FOLDER = jutil.join_relative_path("trade/analyze/static")
 TO_PCT = 100.0
@@ -93,8 +94,11 @@ class AnalyzeView(object):
             raise ValueError
             return
 
-        if not keep_level and len(res.columns) and len(field.split(',')) == 1:
+        #if not keep_level and len(res.columns) and len(field.split(',')) == 1:
+        if not keep_level and len(field.split(',')) == 1:
             res.columns = res.columns.droplevel(level='field')
+            # XXX Save field name for ResReturnFunc
+            #res.columns.name = field
 
         return res
 
@@ -321,7 +325,10 @@ class BaseAnalyzer(object):
         self._cum_alpha_weight_image = None
         self._alpha_decomposition = None
         self._industry_agg = None
-        
+
+        self._sold_alpha_decay = None
+        self._sold_alpha_decay_image = None
+
     @property
     def trades(self):
         """Read-only attribute"""
@@ -515,7 +522,9 @@ class BaseAnalyzer(object):
         # pre-process
         cols_to_drop = ['task_id', 'entrust_no', 'fill_no']
         df = df.drop(cols_to_drop, axis=1)
-        
+
+        perf_tmp = prof_sample_begin("_process_trades")
+
         def _apply(gp_df,inst_map):
             # calculation of non-cumulative fields
             direction = gp_df['entrust_action'].apply(lambda s: 1 if common.ORDER_ACTION.is_positive(s) else -1)
@@ -541,7 +550,8 @@ class BaseAnalyzer(object):
             return gp_df
         gp = df.groupby(by='symbol')
         res = gp.apply(_apply,self.inst_map)
-        
+
+        prof_sample_end(perf_tmp)
         return res
     
     def process_trades(self):
@@ -686,38 +696,157 @@ class BaseAnalyzer(object):
         adj_close.index.names = ['symbol', 'trade_date']         
         merge = pd.concat([close, adj_close, trade], axis=1, join='outer')
         
-        def _apply(gp_df,inst_map):
-            symbol = gp_df.index.levels[0][0]
-            mult = self.inst_map.get(symbol).get("multiplier")
+        # def _apply(gp_df,inst_map):
+        #     symbol = gp_df.index.levels[0][0]
+        #     mult = self.inst_map.get(symbol).get("multiplier")
+        #     cols_nan_to_zero = ['BuyVolume', 'SellVolume', 'commission']
+        #     cols_nan_fill = ['close', 'position', 'AvgPosPrice', 'CumNetTurnOver']
+        #     # merge: pd.DataFrame
+        #     gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(method='ffill')
+        #     gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(0)
+        #
+        #     gp_df.loc[:, cols_nan_to_zero] = gp_df.loc[:, cols_nan_to_zero].fillna(0)
+        #
+        #     mask = gp_df.loc[:, 'AvgPosPrice'] < 1e-5
+        #     gp_df.loc[mask, 'AvgPosPrice'] = gp_df.loc[mask, 'close']
+        #
+        #     gp_df.loc[:, 'CumProfit']     = gp_df.loc[:, 'CumNetTurnOver'] + mult * gp_df.loc[:, 'position'] * gp_df.loc[:, 'close']
+        #     gp_df.loc[:, 'CumProfitComm'] = gp_df['CumProfit'] - gp_df['commission'].cumsum()
+        #
+        #     daily_net_turnover = gp_df['CumNetTurnOver'].diff(1).fillna(gp_df['CumNetTurnOver'].iat[0])
+        #     daily_position_change = gp_df['position'].diff(1).fillna(gp_df['position'].iat[0])
+        #     gp_df['trading_pnl']      = (daily_net_turnover + mult * gp_df['close'] * daily_position_change - gp_df['commission'])
+        #     gp_df['holding_pnl']      = (mult * gp_df['close'].diff(1) * gp_df['position'].shift(1)).fillna(0.0)
+        #     gp_df.loc[:, 'total_pnl'] = gp_df['trading_pnl'] + gp_df['holding_pnl']
+        #     gp_df['trade_shares']     = daily_position_change
+        #
+        #     return gp_df
+
+        # gp = merge.groupby(by='symbol')
+        # res = gp.apply(_apply,self.inst_map)a.columns
+        # self.daily = res
+
+
+        prof_tmp = prof_sample_begin("get_daily")
+
+        def get_ts(dv, field):
+            df = dv.loc[:, pd.IndexSlice[slice(None), field]]
+            df.columns = df.columns.droplevel(1)
+            return df
+
+        def set_ts(dv, field, df):
+            df.columns = pd.MultiIndex.from_product([[field], df.columns])
+            # df = df.sort_index(axis=1)
+
+            dv.columns = dv.columns.swaplevel()
+            #dv = dv.sort_index(axis=1)
+
+            if field not in dv.columns.levels[0]:
+                new_cols = dv.columns.append(df.columns)
+                dv = dv.reindex(columns=new_cols)
+            dv[field] = df[field]
+            dv.columns = dv.columns.swaplevel()
+            #the_data = the_data.sort_index(axis=1)
+
+            return dv
+
+        def build_daily(dv, inst_map):
+
+            if False:
+                mult = get_ts(dv, 'close')
+                for symbol in mult.columns:
+                    mult[symbol] = 1.0#inst_map.get(symbol).get("multiplier")
+            else:
+                mult = 1.0
+
             cols_nan_to_zero = ['BuyVolume', 'SellVolume', 'commission']
             cols_nan_fill = ['close', 'position', 'AvgPosPrice', 'CumNetTurnOver']
-            # merge: pd.DataFrame
-            gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(method='ffill')
-            gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(0)
-    
-            gp_df.loc[:, cols_nan_to_zero] = gp_df.loc[:, cols_nan_to_zero].fillna(0)
-    
-            mask = gp_df.loc[:, 'AvgPosPrice'] < 1e-5
-            gp_df.loc[mask, 'AvgPosPrice'] = gp_df.loc[mask, 'close']
-    
-            gp_df.loc[:, 'CumProfit'] = gp_df.loc[:, 'CumNetTurnOver'] + mult * gp_df.loc[:, 'position'] * gp_df.loc[:, 'close']
-            gp_df.loc[:, 'CumProfitComm'] = gp_df['CumProfit'] - gp_df['commission'].cumsum()
-    
-            daily_net_turnover = gp_df['CumNetTurnOver'].diff(1).fillna(gp_df['CumNetTurnOver'].iat[0])
-            daily_position_change = gp_df['position'].diff(1).fillna(gp_df['position'].iat[0])
-            gp_df['trading_pnl'] = (daily_net_turnover + mult * gp_df['close'] * daily_position_change - gp_df['commission'])            
-            gp_df['holding_pnl'] = (mult * gp_df['close'].diff(1) * gp_df['position'].shift(1)).fillna(0.0)
-            gp_df.loc[:, 'total_pnl'] = gp_df['trading_pnl'] + gp_df['holding_pnl']
-            gp_df['trade_shares'] = daily_position_change
-            
-            return gp_df
 
-        gp = merge.groupby(by='symbol')
-        res = gp.apply(_apply,self.inst_map)        
-        self.daily = res
+            for col in cols_nan_fill:
+                df = get_ts(dv, col)
+                df = df.fillna(method='ffill').fillna(0)
+                dv = set_ts(dv, col, df)
+
+            # # merge: pd.DataFrame
+            # gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(method='ffill')
+            # gp_df.loc[:, cols_nan_fill] = gp_df.loc[:, cols_nan_fill].fillna(0)
+
+            for col in cols_nan_to_zero:
+                df = get_ts(dv, col)
+                df = df.fillna(0)
+                dv = set_ts(dv, col, df)
+            #gp_df.loc[:, cols_nan_to_zero] = gp_df.loc[:, cols_nan_to_zero].fillna(0)
+
+            df = get_ts(dv, 'AvgPosPrice').copy()
+            mask = df < 1e-5
+            df_close = get_ts(dv, 'close')
+            df[mask] = df_close[mask]
+            dv = set_ts(dv, 'AvgPosPrice', df)
+
+            # mask = gp_df.loc[:, 'AvgPosPrice'] < 1e-5
+            # gp_df.loc[mask, 'AvgPosPrice'] = gp_df.loc[mask, 'close']
+
+            df_turnover    = get_ts(dv, 'CumNetTurnOver')
+            df_position    = get_ts(dv, 'position')
+            df_profit      = df_turnover + mult * df_position * df_close
+            df_commisson   = get_ts(dv, 'commission')
+            df_profit_comm = df_profit - df_commisson.cumsum()
+
+            dv = set_ts(dv, 'CumProfit', df_profit)
+            dv = set_ts(dv, 'CumProfitComm', df_profit_comm)
+
+            # gp_df.loc[:, 'CumProfit'] = gp_df.loc[:, 'CumNetTurnOver'] + mult * gp_df.loc[:, 'position'] * gp_df.loc[:,'close']
+            # gp_df.loc[:, 'CumProfitComm'] = gp_df['CumProfit'] - gp_df['commission'].cumsum()
+
+            daily_net_turnover    = df_turnover.diff(1)#.fillna(df_turnover.iat[0])
+            daily_net_turnover.iloc[0] = df_turnover.iloc[0]
+
+            daily_position_change = df_position.diff(1)#.fillna(gp_df['position'].iat[0])
+            daily_position_change.iloc[0] = df_position.iloc[0]
+
+            # daily_net_turnover = gp_df['CumNetTurnOver'].diff(1).fillna(gp_df['CumNetTurnOver'].iat[0])
+            # daily_position_change = gp_df['position'].diff(1).fillna(gp_df['position'].iat[0])
+
+            df_trading_pnl = (daily_net_turnover + mult * df_close * daily_position_change - df_commisson)
+            df_holding_pnl = (mult * df_close.diff(1) * df_position.shift(1)).fillna(0.0)
+            df_total_pnl = df_trading_pnl + df_holding_pnl
+
+            dv = set_ts(dv, 'trading_pnl',  df_trading_pnl)
+            dv = set_ts(dv, 'holding_pnl',  df_holding_pnl)
+            dv = set_ts(dv, 'total_pnl',    df_total_pnl)
+            dv = set_ts(dv, 'trade_shares', daily_position_change)
+
+
+            # gp_df['trading_pnl'] = (daily_net_turnover + mult * gp_df['close'] * daily_position_change - gp_df['commission'])
+            # gp_df['holding_pnl'] = (mult * gp_df['close'].diff(1) * gp_df['position'].shift(1)).fillna(0.0)
+            # gp_df.loc[:, 'total_pnl'] = gp_df['trading_pnl'] + gp_df['holding_pnl']
+            # gp_df['trade_shares'] = daily_position_change
+            #
+            # return gp_df
+
+            return dv
+
+        dv = merge.copy()
+        dv.index =dv.index.swaplevel()
+        dv = dv.unstack()
+        dv.columns = dv.columns.swaplevel()
+
+        dv = build_daily(dv, self.inst_map)
+
+        # Index(date) : Column(code/field) -> Index(code/date) : Column(field)
+        a = dv.copy()
+        a.columns = a.columns.swaplevel()
+        a = a.stack()
+        a.index = a.index.swaplevel()
+        print(a.columns)
+
+        self.daily = a
+
         if self._is_alpha_analyzer and self.dataview:
             self._build_holding_data()
             self._build_portfolio_data()
+
+        prof_tmp.end()
 
         self.save_data()
 
@@ -800,6 +929,14 @@ class BaseAnalyzer(object):
         total_mktvalue = df_mktvalue.apply(lambda x: x.sum(), axis=1)
         df_weight = df_mktvalue.div(total_mktvalue, axis=0)
         holding_data.add_field(df_weight, "weight")
+
+        for i in range(5):
+            day = i + 1
+            field_name = 'T+{0}'.format(day )
+
+            field_value = df_weight * df_active_return.rolling(day).sum().shift(-day)
+            #field_value = df_weight * df_active_return.shift(-day)
+            holding_data.add_field(field_value, field_name)
 
         holding_data._data = holding_data._data.drop(
             ['AvgPosPrice', 'BuyVolume', 'CumNetTurnOver', 'CumProfit', 'CumProfitComm', 'SellVolume'], axis=1, level=1)
@@ -1044,6 +1181,15 @@ class BaseAnalyzer(object):
 
         mpl.rcParams.update(old_mpl_rcparams)
 
+    def plot_sold_alpha_decay(self, df, output_folder):
+        fig, ax = plt.subplots(figsize=(16, 8))
+        fig, ax = plt.subplots(figsize=(16, 8))
+        plt.bar(df.index, df['alpha'].values)
+
+        fig.savefig(os.path.join(output_folder, self._sold_alpha_decay_image), facecolor=fig.get_facecolor(), dpi=fig.get_dpi())
+
+        plt.close(fig)
+
     def analyze_alpha_decay(self,result_dir):
 
         # 个股平均持仓
@@ -1064,13 +1210,13 @@ class BaseAnalyzer(object):
         df_alpha.columns = ['alpha']
         df_alpha = pd.merge(left=df_alpha, right=self.dataview.data_inst[['name']], left_index=True, right_index=True, how='left')
         df_alpha = df_alpha[df_alpha['alpha'] != 0]
-        df_alpha.sort_values('alpha', ascending=False)
+        df_alpha.sort_values('alpha', ascending=False, inplace=True)
         df_alpha_weight = pd.concat([df_weight, df_alpha], axis=1)
 
         # Alpha在个股中分布
         n_group = 5
         df_alpha_weight = df_alpha_weight.sort_values('mean_weight', ascending=False)
-        df_alpha_weight['rank'] = range(len(df_alpha))
+        df_alpha_weight['rank'] = range(len(df_alpha_weight))
         df_alpha_weight['group'] = df_alpha_weight['rank'].apply(lambda x: int(x / n_group))
         df_alpha_weight['alpha_ratio'] = df_alpha_weight['alpha'] / df_alpha_weight['alpha'].sum()
 
@@ -1305,6 +1451,74 @@ class BaseAnalyzer(object):
         self._industry_agg = df_industry_agg
         self._alpha_decomposition = df_alpha_agg
 
+    def analyze_alpha_weight_contribution(self, result_dir):
+        """
+        Get top 40% weights of stocks and calculate its alpaha contribution
+        :return:
+        """
+
+        # Get Top 40% wight stocks
+        mv = self.holding_data.get_ts('holding_shares') * self.holding_data.get_ts('close')
+        total_mv = mv.sum(axis=1)
+
+        for col in mv.columns:
+            mv[col] /= total_mv
+
+        weight_in_day = mv
+
+        weight_in_cycle = weight_in_day.sum(axis=0).sort_values(ascending=False)
+        tmp = weight_in_cycle.cumsum()
+        weight_in_cycle = weight_in_cycle[tmp < tmp[-1] * 0.4]
+        weight_in_cycle /= tmp[-1]
+        symbols = weight_in_cycle.index
+
+        # Get alpha contribution of each stock on whole test cycle
+        active_return = self.holding_data.get_ts('active_holding_return') * weight_in_day
+        alpha_contribution = active_return.loc[:, symbols].sum()
+
+        df_contrib = pd.DataFrame(index=weight_in_cycle.index)
+        df_contrib['symbol'] = weight_in_cycle.index
+        df_contrib['name']   = df_contrib['symbol'].apply(lambda x: self.inst_map[x]['name'])
+        df_contrib['weight']             = weight_in_cycle.apply(lambda x: str(np.round(x * 100, 2)) + "%")
+        df_contrib['alpha_contribution'] = alpha_contribution.apply(lambda x: str(np.round(x * 100, 2)) + "%")
+        df_contrib.reset_index(drop=True, inplace=True)
+
+        holding_shares = self.holding_data.get_ts('holding_shares').sum(axis=0)
+
+        self._alpha_weight_traded_stocks = holding_shares[holding_shares>0].shape[0]
+        self._alpha_wegith_contribution = df_contrib
+
+    def analyze_sold_alpha_decay(self, result_dir):
+        """
+        Take sold stocks as a portfolio and calculate next 10 days' pnl.
+        """
+
+        # Get Top 40% wight stocks
+        sold_shares = self.holding_data.get_ts('holding_shares').diff()
+        sold_shares *= np.where(sold_shares < 0, -1, 0)
+
+        mv = sold_shares * self.holding_data.get_ts('close')
+        total_mv = mv.sum(axis=1)
+
+        for col in mv.columns:
+            mv[col] /= total_mv
+
+        weight_in_day = mv
+
+        active_return = self.holding_data.get_ts('active_holding_return')
+
+        sold_pnl = [0 for i in range(10)]
+        for day in range(10):
+            sold_pnl[day] = (active_return.shift(day + 1) * weight_in_day).sum(axis=1).mean()
+
+        df = pd.DataFrame(sold_pnl)
+        df.columns = ['alpha']
+        df.index = [i + 1 for i in range(10)]
+
+        self._sold_alpha_decay_image = "sold_alpha_decay.png"
+        self._sold_alpha_decay = df
+        self.plot_sold_alpha_decay(df, result_dir)
+
     def plot_return_heatmap(self, df, image_name, output_folder, figsize):
 
         # plot
@@ -1510,6 +1724,13 @@ class BaseAnalyzer(object):
         dic['average_industry_overweight'] = self._average_industry_overweight
         dic['alpha_decomposition'] = self._alpha_decomposition
         dic['industry_agg'] = self._industry_agg
+
+        dic['alpha_weight_contribution']  = self._alpha_wegith_contribution
+        dic['alpha_weight_traded_stocks'] = self._alpha_weight_traded_stocks
+
+        dic['sold_alpha_decay_image'] = self._sold_alpha_decay_image
+
+
         self.report_dic.update(dic)
         
         r = Report(self.report_dic, source_dir=source_dir, template_fn=template_fn, out_folder=out_folder)
@@ -1541,9 +1762,14 @@ class BaseAnalyzer(object):
         print("process trades...")
         self.process_trades()
         print("get daily stats...")
+
         self.get_daily()
+
         print("calc strategy return...")
+
+        prof_tmp = prof_sample_begin("get_returns")
         self.get_returns(compound_return = compound_rtn, consider_commission=True)
+        prof_tmp.end()
 
         if len(selected_sec) > 0:
             print("Plot single securities PnL")
@@ -1740,22 +1966,51 @@ class AlphaAnalyzer(BaseAnalyzer):
         mask = (self._raw_trades['fill_no'] != '101010') & (self._raw_trades['fill_no'] != '202020')
         trades_rebalance = self._raw_trades.loc[mask]
         rebalance_dates = trades_rebalance['trade_date'].unique()
-        
-        daily_pos_name = self.daily_position.T.copy()
-        daily_pos_name.loc[:, 0] = u'               '
-        for idx, _ in daily_pos_name.iterrows():
-            daily_pos_name.loc[idx, 0] = self.inst_map[idx]['name']
-        
+
+        tmp = self.holding_data.get_ts('holding_shares')
+        for col in tmp.columns:
+            tmp[col] = self.inst_map[col]['name']
+
+        self.holding_data.add_field(tmp, 'name')
+
         dic_pos = OrderedDict()
         for date in rebalance_dates:
-            daily = daily_pos_name.loc[:, [0, date]]
-            daily = daily.loc[daily[date] >= 1]
-            daily = daily.reset_index()
-            daily.index.name = date
-            daily.columns = ['symbol', 'name', 'position']
-            daily.loc[:, 'position'] = daily['position'].astype(np.integer)
-            dic_pos[date] = daily
+            fields = ['name', 'holding_shares','weight', 'T+1','T+2','T+3','T+4','T+5']
+            daily = self.holding_data.data.loc[[date], pd.IndexSlice[:, fields]].T.unstack()
+            daily.columns = daily.columns.droplevel(level='trade_date')
+            daily.columns.name = ""
+            daily['symbol'] = daily.index
+
+            daily.reset_index(drop=True, inplace=True)
+            daily.index.name = ""
+            daily.rename(inplace=True, columns= {'holding_shares': 'position'})
+
+            daily = daily.sort_values('weight', ascending=False)
+            for col in ['weight', 'T+1', 'T+2', 'T+3', 'T+4', 'T+5']:
+                daily[col] = daily[col].apply(lambda x: str(np.round(x * 100, 2)) + "%")
+
+            daily = daily[['symbol', 'name', 'position', 'weight', 'T+1','T+2','T+3','T+4','T+5']]
+
+            dic_pos[date] = daily[(daily['weight'] != "0.0%") & (daily['weight'] != "nan%")]
+            dic_pos[date].index = range(1, len(dic_pos[date]) + 1)
+
         self.rebalance_positions = dic_pos
+
+        # daily_pos_name = self.daily_position.T.copy()
+        # daily_pos_name.loc[:, 0] = u'               '
+        # for idx, _ in daily_pos_name.iterrows():
+        #     daily_pos_name.loc[idx, 0] = self.inst_map[idx]['name']
+        #
+        # dic_pos = OrderedDict()
+        # for date in rebalance_dates:
+        #     daily = daily_pos_name.loc[:, [0, date]]
+        #     daily = daily.loc[daily[date] >= 1]
+        #     daily = daily.reset_index()
+        #     daily.index.name = date
+        #     daily.columns = ['symbol', 'name', 'position']
+        #     daily.loc[:, 'position'] = daily['position'].astype(np.integer)
+        #     dic_pos[date] = daily
+        # self.rebalance_positions = dic_pos
         
     @staticmethod
     def calc_win_ratio(ret_arr):
@@ -1828,6 +2083,8 @@ class AlphaAnalyzer(BaseAnalyzer):
             self.analyze_alpha_decay(result_dir)
             self.analyze_industry_overweight(result_dir)
             self.analyze_alpha_contribution(result_dir)
+            self.analyze_alpha_weight_contribution(result_dir)
+            self.analyze_sold_alpha_decay(result_dir)
         else:
             print("Ignore analyzing alpha data")
 

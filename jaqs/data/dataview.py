@@ -13,6 +13,7 @@ except NameError:
 
 import numpy as np
 import pandas as pd
+import re
 
 import jaqs.util as jutil
 from jaqs.data.align import align
@@ -28,13 +29,14 @@ class FactorDef:
 
 
 class FactorFunc:
-    def __init__(self, dv, factor):
+    def __init__(self, dv, factor, allow_future_data):
         self._factor = factor
         self._dv = dv
+        self._allow_future_data = allow_future_data
 
     def __call__(self, *args, **kwargs):
 
-        parser = self._dv._create_parser()
+        parser = self._dv._create_parser(allow_future_data=self._allow_future_data)
 
         # print("exec factor: " + self._factor.name + "(" + ','.join(self._factor.args) + ")=" + self._factor.body)
         expr = parser.parse(self._factor.body)
@@ -48,9 +50,9 @@ class FactorFunc:
                 var_df_dic[var] = args[i]
             elif var in parser.functions:
                 if var in self._dv._import_factors and not self._dv._import_factors[var].args:
-                    var_df_dic[var] = self._dv._get_var(var)
+                    var_df_dic[var] = self._dv._get_var(var, self._allow_future_data)
             else:
-                var_df_dic[var] = self._dv._get_var(var)
+                var_df_dic[var] = self._dv._get_var(var, self._allow_future_data)
 
         # TODO: send ann_date into expr.evaluate. We assume that ann_date of all fields of a symbol is the same
         df_ann = self._dv._get_ann_df()
@@ -60,12 +62,54 @@ class FactorFunc:
         return df_eval
 
 
-class LabelDef(FactorDef):
-    pass
+
+class ResReturnFunc:
+    """
+    ResReturn(close, m, n)
+    """
+    def __init__(self, dv, allow_future_data):
+        self._dv = dv
+        self._allow_future_data = allow_future_data
+
+    def __call__(self, *args, **kwargs):
+
+        parser = self._dv._create_parser(allow_future_data=self._allow_future_data)
+
+        # print("exec factor: " + self._factor.name + "(" + ','.join(self._factor.args) + ")=" + self._factor.body)
+        field_name = args[0].columns.name
+        formula = "Return({0}, {1}, {2}) - Return({3},{1},{2})".format(
+            field_name, args[1], args[2],
+            "bm_" + field_name
+        )
+        expr = parser.parse(formula)
+
+        var_df_dic = dict()
+        var_list = expr.variables()
+
+        for var in var_list:
+            # if var in self._factor.args:
+            #     i = self._factor.args.index(var)
+            #     var_df_dic[var] = args[i]
+            if var in parser.functions:
+                if var in self._dv._import_factors and not self._dv._import_factors[var].args:
+                    var_df_dic[var] = self._dv._get_var(var, self._allow_future_data)
+            else:
+                var_df_dic[var] = self._dv._get_var(var, self._allow_future_data)
+
+        # TODO: send ann_date into expr.evaluate. We assume that ann_date of all fields of a symbol is the same
+        df_ann = self._dv._get_ann_df()
+
+        df_eval = parser.evaluate(var_df_dic, ann_dts=df_ann, trade_dts=self._dv.dates)
+
+        return df_eval
 
 
-class LabelFunc(FactorFunc):
-    pass
+# class LabelDef(FactorDef):
+#     pass
+#
+#
+# class LabelFunc(FactorFunc):
+#     pass
 
 
 class DataView(object):
@@ -110,6 +154,8 @@ class DataView(object):
         self.load_factors = []
         self.labels = []
         self.load_labels = []
+        self.index_weights = {}
+        self.industry_groups = {}
 
         self.meta_data_list = ['start_date', 'end_date',
                                'extended_start_date_d', 'extended_start_date_q',
@@ -367,6 +413,8 @@ class DataView(object):
         self.TRADE_STATUS_FIELD_NAME = 'trade_status'
         self.TRADE_DATE_FIELD_NAME = 'trade_date'
 
+        self.misc_data = [ 'st_flag' ]
+
     # --------------------------------------------------------------------------------------------------------
     # Properties
     @property
@@ -455,7 +503,8 @@ class DataView(object):
                 or field_name in self.rating_data
                 or field_name in self.lgt_data
                 or field_name in self.consensus_data
-                or field_name in self.stk_rating_data)
+                or field_name in self.stk_rating_data
+                or field_name in self.misc_data)
         return flag
 
     def _is_predefined_field(self, field_name):
@@ -501,7 +550,8 @@ class DataView(object):
                     'lgt_data' : self.lgt_data,
                     'rating_data': self.rating_data,
                     'consensus_data': self.consensus_data,
-                    'stk_rating_data': self.stk_rating_data
+                    'stk_rating_data': self.stk_rating_data,
+                    'misc_data' : self.misc_data
                     }
         pool_map['daily'] = set.union(pool_map['market_daily'],
                                       pool_map['ref_daily'],
@@ -818,6 +868,10 @@ class DataView(object):
         if tmp_fields:
             multi_daily = self.query_stk_rating_data(tmp_fields, multi_daily)
 
+        tmp_fields = self._get_fields('misc_data', fields, append=True)
+        if tmp_fields:
+            multi_daily = self.query_misc_data(tmp_fields, multi_daily)
+
         return multi_daily, multi_quarterly
 
     def query_rating_data(self, fields_rating_ind, daily_df):
@@ -885,12 +939,13 @@ class DataView(object):
                 rolling_types.add( f.split('_')[-1] )
 
 
+        nsymbols  = 20
         data = []
-        for i in range((len(self.symbol) + 19) // 20):
-            symbols = self.symbol[i*20: (i+1)*20]
+        for i in range((len(self.symbol) + nsymbols -1) // nsymbols):
+            symbols = self.symbol[i*nsymbols: (i+1)*nsymbols]
 
             filter_str = "symbol={0}&start_date={1}&end_date={2}&rolling_type={3}".format(
-                ','.join(self.symbol),
+                ','.join(symbols),
                 self.extended_start_date_d,
                 self.end_date,
                 ','.join(rolling_types).upper()
@@ -907,7 +962,6 @@ class DataView(object):
             if df is None:
                 raise ValueError("query wd.stkConsensusRollingData Error:" + msg)
             data.append(df)
-            break
 
         df = pd.concat(data)
         df['date'] = df['date'].astype(int)
@@ -982,6 +1036,39 @@ class DataView(object):
         self.append_df(lgt_holding_ratio, 'lgt_holding_ratio', is_quarterly=False)
 
         self.remove_field('_regdt,lgt_holding_origin,lgt_holding_ratio_origin')
+        daily_df = self.data_d
+        self.data_d = data_d_orig
+        return daily_df
+
+    def query_misc_data(self, fields, daily_df):
+
+        data_d_orig = self.data_d
+        self.data_d = daily_df
+
+        if 'st_flag' in fields:
+            df, msg = self.data_api.query(view='wd.stockST')
+            if df is None:
+                raise ValueError("query wd.secStockRatingConsus Error:" + msg)
+
+            st_symbols = df['symbol'].unique()
+            st_daily = self.get_ts('high')
+            for symbol in st_daily.columns:
+                st_daily[symbol] = ''
+                if symbol not in st_symbols: continue
+                tmp = df[df['symbol']==symbol]
+                for i in range(len(tmp)):
+                    x = tmp.iloc[i]
+                    entry_date = x['entry_dt']
+                    remove_dt  = x['remove_dt']
+                    if remove_dt == 0 :
+                        remove_dt = 99999999
+                    else:
+                        remove_dt -= 1
+                    stype = x['stype']
+                    st_daily.loc[pd.IndexSlice[entry_date: remove_dt], [symbol]] = stype
+
+            self.append_df(st_daily, 'st_flag', is_quarterly=False)
+
         daily_df = self.data_d
         self.data_d = data_d_orig
         return daily_df
@@ -1261,8 +1348,12 @@ class DataView(object):
             self.append_df(df, 'index_member', is_quarterly=False)
 
             # use weights of the first universe
-            df_weights = self.data_api.query_index_weights_daily(self.universe[0], self.extended_start_date_d,
+            df_weights = self.data_api.query_index_weights_daily(first_universe, self.extended_start_date_d,
                                                                  self.end_date)
+
+            if first_universe not in self.index_weights:
+                self.index_weights[first_universe] = df_weights
+
             self.append_df(df_weights, 'index_weight', is_quarterly=False)
 
     def _prepare_report_date(self):
@@ -1295,6 +1386,7 @@ class DataView(object):
                                                     start_date=self.extended_start_date_q, end_date=self.end_date,
                                                     type_=type_, level=level)
             self.append_df(df, field, is_quarterly=False)
+            self.industry_groups[field] = df
 
     def _prepare_benchmark(self):
         if self.benchmark == 'VW_UNIVERSE':
@@ -1319,9 +1411,26 @@ class DataView(object):
             df_bench, msg = self.data_api.daily(self.benchmark,
                                                 start_date=self.extended_start_date_d, end_date=self.end_date,
                                                 adjust_mode=self.adjust_mode,
-                                                fields='trade_date,symbol,close,vwap,volume,turnover')
+                                                fields='trade_date,symbol,open,high,low,close,vwap,volume,turnover')
             # TODO: we want more than just close price of benchmark
-            df_bench = df_bench.set_index('trade_date').loc[:, ['close']]
+            df_bench = df_bench.set_index('trade_date').loc[:, ['open','high','low','close']]
+
+            is_index = re.match('399.*.SZ', self.benchmark) or re.match('000.*.SH', self.benchmark)
+            if is_index:
+                # use weights of the first universe
+                if self.benchmark not in self.index_weights:
+                    df_weights = self.data_api.query_index_weights_daily(self.benchmark, self.extended_start_date_d,
+                                                                     self.end_date)
+                    self.index_weights[self.benchmark] = df_weights
+
+            # Add bm_high, bm_low, bm_open, bm_close to each code
+            tmp = self.get_ts('open')
+            for field in ['open','high','low','close']:
+                for symbol in tmp.columns:
+                    tmp[symbol] = df_bench[field]
+                self.append_df(tmp,   'bm_' + field,  is_quarterly=False)
+
+            df_bench = df_bench[['close']]
         return df_bench
 
     # --------------------------------------------------------------------------------------------------------
@@ -1394,17 +1503,23 @@ class DataView(object):
             self.append_df(df_expanded, field_name, is_quarterly=False)
         return True
 
-    def _create_parser(self, formula_func_name_style='camel'):
-        parser = Parser()
+    def _create_parser(self, formula_func_name_style='camel', allow_future_data=False):
+        parser = Parser(allow_future_data=allow_future_data)
         parser.set_capital(formula_func_name_style)
 
         for key in self._import_factors:
             factor = self._import_factors[key]
-            parser.register_function(factor.name, FactorFunc(self, factor))
+            parser.register_function(factor.name, FactorFunc(self, factor, allow_future_data))
 
+        parser.register_function("ResReturn", ResReturnFunc(self, allow_future_data))
         return parser
 
-    def _get_var(self, var):
+    def _get_var(self, var, allow_future_data):
+
+        if not allow_future_data:
+            if var in self.labels:
+                raise ValueError("Variable {0} is label while calculating factor!".format(var))
+
         if var in self._import_factors:
             if self._is_quarter_field(var):
                 df_var = self.get_ts_quarter(var, start_date=self.extended_start_date_q)
@@ -1412,7 +1527,7 @@ class DataView(object):
                 df_var = self.get_ts(var, start_date=self.extended_start_date_d, end_date=self.end_date)
             else:
                 factor_def = self._import_factors[var]
-                df_var = FactorFunc(self, factor_def)()
+                df_var = FactorFunc(self, factor_def, allow_future_data)()
                 self.append_df(df_var, var, is_quarterly=factor_def.is_quarterly)
 
             return df_var
@@ -1427,14 +1542,17 @@ class DataView(object):
         if not name:
             name = factor.split('(')[0]
 
-        self.add_formula(field_name=name, formula=factor, is_quarterly=is_quarterly)
+        self.add_formula(field_name=name, formula=factor, is_quarterly=is_quarterly, is_factor=True)
 
     def add_label(self, factor, name=None, is_quarterly=False):  # within_index=True):
-        self.add_factor(factor, name, is_quarterly)
+        if not name:
+            name = factor.split('(')[0]
+
+        self.add_formula(field_name=name, formula=factor, is_quarterly=is_quarterly, is_factor=False)
 
     def add_formula(self, field_name, formula, is_quarterly, overwrite=True,
                     formula_func_name_style='camel', data_api=None,
-                    within_index=True):
+                    within_index=True, is_factor=True):
         """
         Add a new field, which is calculated using existing fields.
 
@@ -1452,6 +1570,8 @@ class DataView(object):
         data_api : RemoteDataService, optional
         within_index : bool
             When do cross-section operatioins, whether just do within index components.
+        is_factor: bool
+            Whether new field is factor or label.
 
         Notes
         -----
@@ -1471,7 +1591,7 @@ class DataView(object):
         elif self._is_predefined_field(field_name):
             raise ValueError("[{:s}] is alread a pre-defined field. Please use another name.".format(field_name))
 
-        parser = self._create_parser(formula_func_name_style)
+        parser = self._create_parser(formula_func_name_style, allow_future_data=not is_factor)
         expr = parser.parse(formula)
 
         var_df_dic = dict()
@@ -1493,6 +1613,13 @@ class DataView(object):
                     success = self.add_field(var)
                     if not success:
                         return
+        if is_factor:
+            for var in var_list:
+                if var in self.labels:
+                    raise ValueError("Variable {0} is label while calculating factor!".format(var))
+        else:
+            if field_name not in self.labels:
+                self.labels.append(field_name)
 
         for var in var_list:
             if self._is_quarter_field(var):
@@ -1805,8 +1932,11 @@ class DataView(object):
             raise ValueError
             return
 
-        if not keep_level and len(res.columns) and len(field.split(',')) == 1:
+        #if not keep_level and len(res.columns) and len(field.split(',')) == 1:
+        if not keep_level and len(field.split(',')) == 1:
             res.columns = res.columns.droplevel(level='field')
+            # XXX Save field name for ResReturnFunc
+            res.columns.name = field
 
         return res
 
@@ -1852,7 +1982,7 @@ class DataView(object):
 
             factor_id = factor_expr.split('(')[0].strip()
             if factor_id not in self._import_factors:
-                print("Can't find factor definitions: " + factor_id)
+                #print("Can't find factor definitions: " + factor_id)
                 continue
             if self._import_factors[factor_id].is_quarterly:
                 t = self.get_ts_quarter(factor_name)
@@ -1918,6 +2048,13 @@ class DataView(object):
         self._data_benchmark = dic.get('/data_benchmark', None)
         self._data_inst = dic.get('/data_inst', None)
         self._factor_df = dic.get('/factor_df', None)
+
+        for k in dic.keys():
+            if k.startswith('/index_weight/'):
+                self.index_weights[k.split('/')[2]] = dic[k]
+            if k.startswith('/industry_group/'):
+                self.industry_groups[k.split('/')[2]] = dic[k]
+
         self.__dict__.update(meta_data)
 
         for index, row in self._factor_df.iterrows():
@@ -1956,8 +2093,15 @@ class DataView(object):
                          'data_inst': self.data_inst,
                          'factor_df': self._factor_df
                          }
+        for symbol in self.index_weights.keys():
+            data_to_store['index_weight/' + symbol] = self.index_weights[symbol]
+
+        for group in self.industry_groups.keys():
+            data_to_store['industry_group/' + group] = self.industry_groups[group]
+
         data_to_store = {k: v for k, v in data_to_store.items() if v is not None}
         meta_data_to_store = {key: self.__dict__[key] for key in self.meta_data_list}
+
 
         print("\nStore data...")
         jutil.save_json(meta_data_to_store, meta_path)
@@ -2053,9 +2197,76 @@ class DataView(object):
             meta_data['fields'] = fields
         dv2.__dict__.update(meta_data)
 
+        dv2.index_weights = {}
+        for k,v in self.index_weights.items():
+            dv2.index_weights[k] = v[ (v.index >= extended_start_date_d) & (v.index <= end_date)]
+
+        dv2.industry_groups = {}
+        for k,v in self.index_weights.items():
+            dv2.industry_groups[k] = v[(v.index >= extended_start_date_d) & (v.index <= end_date)]
+
         dv2._process_data(large_memory=large_memory)
         return dv2
 
+    @staticmethod
+    def concat(dv1, dv2):
+        def concat_df(dv1, dv2, name):
+            a = dv1.__dict__[name]
+            b = dv2.__dict__[name]
+            if a is None:
+                return b
+            elif b is None:
+                return a
+            else:
+                a = a[a.index < dv2.start_date]
+                b = b[b.index > dv1.end_date]
+                return pd.concat([a, b])
+
+        dv = DataView()
+        for key in dv.meta_data_list:
+            dv.__dict__[key] = dv1.__dict__[key]
+
+        dv.end_date = dv2.end_date
+        for key in ['fields', 'symbol', 'custom_daily_fields', 'custom_quarterly_fields',
+                    'factors', 'load_factors', 'labels', 'load_labels']:
+            dv.__dict__[key] = list(set(dv1.__dict__[key] + dv2.__dict__[key]))
+
+        dv._data_inst = pd.concat([dv1._data_inst, dv2._data_inst]).drop_duplicates()
+        dv._factor_df = pd.concat([dv1._factor_df, dv2._factor_df])
+
+        if not dv._factor_df.empty:
+            dv._factor_df.drop_duplicates('factor_id')
+            for index, row in dv._factor_df.iterrows():
+                factor_id = row['factor_id']
+                factor_body = row['factor_def']
+                factor_args = list(filter(None, row['factor_args'].split(',')))
+                if 'factor_quarterly' in row:
+                    factor_quarterly = row['factor_quarterly']
+                else:
+                    factor_quarterly = False
+
+                dv._import_factors[factor_id] = FactorDef(factor_id, factor_args, factor_body, factor_quarterly)
+
+        dv.index_weights = {}
+        for k,v in dv1.index_weights.items():
+            if k in dv2.index_weights:
+                df1 = v
+                df2 = dv2.index_weights[k]
+                dv.index_weights[k] = pd.concat( [df1[df1.index < dv2.start_date], df2[df2.index > dv1.end_date]] )
+
+        dv.industry_groups = {}
+        for k,v in dv1.industry_groups.items():
+            if k in dv2.industry_groups:
+                df1 = v
+                df2 = dv2.industry_groups[k]
+                dv.industry_groups[k] = pd.concat( [ df1[df1.index < dv2.start_date], df2[df2.index > dv1.end_date] ] )
+
+        dv.data_d = concat_df(dv1, dv2, 'data_d')
+        dv.data_q = concat_df(dv1, dv2, 'data_q')
+        dv._data_benchmark = concat_df(dv1, dv2, '_data_benchmark')
+
+        dv._process_data(True if dv1._snapshot else False)
+        return dv
 
     def group_demean(self, signal, group, new_name, is_quarterly=False, method='div'):
 
@@ -2067,7 +2278,7 @@ class DataView(object):
         if method == 'div':
             df_all_mask[new_name] = df_all_mask.groupby(['trade_date', group])[signal].apply(lambda x: x / np.nanmedian(x))
         else:
-            df_all_mask[new_name] = df_all_mask.groupby(['trade_date', group])[signal].apply(lambda x: x - np.nanmedian(x))
+            df_all_mask[new_name] = df_all_mask.groupby(['tpdrade_date', group])[signal].apply(lambda x: x - np.nanmedian(x))
 
         ## convert back to long data
         df_all_clean = df_all.loc[:, ['trade_date', 'symbol']]\
@@ -2080,6 +2291,27 @@ class DataView(object):
         self.remove_field(new_name)
         self.append_df(df_all_clean, new_name, is_quarterly=is_quarterly)
         return self
+
+
+    def to_dataframe(self):
+        df = self.data_d.copy()
+        df.columns = df.columns.swaplevel()
+        return df.stack().reset_index()
+
+    @staticmethod
+    def from_dataframe(df):
+        df = df.sort_values(['trade_date','symbol'])
+        df = df.set_index(['trade_date','symbol']).unstack()
+        df.columns = df.columns.swaplevel()
+        df = df.sort_index(axis=1)
+
+        dv = DataView()
+        dv.data_d = df
+        for field in df.columns.levels[1]:
+            dv.fields.append(field)
+        dv.start_date = df.index.min()
+        dv.end_date = df.index.max()
+        return dv
 
 
 class EventDataView(object):
@@ -2721,7 +2953,7 @@ class EventDataView(object):
 
     def add_formula(self, field_name, formula, is_quarterly, overwrite=True,
                     formula_func_name_style='camel', data_api=None,
-                    within_index=True):
+                    within_index=True, is_factor=True):
         """
         Add a new field, which is calculated using existing fields.
 
@@ -3186,3 +3418,7 @@ class EventDataView(object):
         for key, value in dic.items():
             h5[key] = value
         h5.close()
+
+
+    # --------------------------------------------------------------------------------------------------------
+    # DataView I/O
